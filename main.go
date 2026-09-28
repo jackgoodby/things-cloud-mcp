@@ -4577,14 +4577,20 @@ func main() {
 	um := NewUserManager()
 	um.proxyURLs = proxyURLs
 
-	// Initialize OAuth server with persistent state
-	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "data"
+	stdioMode := stdioRequested(os.Args[1:])
+
+	// Initialize OAuth server with persistent state. Stdio mode serves one
+	// local user and needs neither OAuth nor stored credentials.
+	var oauth *OAuthServer
+	if !stdioMode {
+		dataDir := os.Getenv("DATA_DIR")
+		if dataDir == "" {
+			dataDir = "data"
+		}
+		oauth = NewOAuthServer(um, dataDir)
+		um.oauth = oauth
+		um.diagStore = &DiagStore{db: oauth.db}
 	}
-	oauth := NewOAuthServer(um, dataDir)
-	um.oauth = oauth
-	um.diagStore = &DiagStore{db: oauth.db}
 
 	hooks := &server.Hooks{}
 	hooks.AddAfterInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest, result *mcp.InitializeResult) {
@@ -4606,6 +4612,13 @@ func main() {
 			"All changes sync to Things 3 apps (Mac, iPhone, iPad) in real-time via Things Cloud."),
 	)
 	mcpServer.AddTools(defineTools(um)...)
+
+	if stdioMode {
+		if err := serveStdio(mcpServer); err != nil {
+			log.Fatalf("stdio server: %v", err)
+		}
+		return
+	}
 
 	streamServer := server.NewStreamableHTTPServer(mcpServer,
 		server.WithEndpointPath("/mcp"),
