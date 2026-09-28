@@ -62,6 +62,10 @@ var (
 	ItemKindTask      ItemKind = "Task6"
 	ItemKindTask4     ItemKind = "Task4"
 	ItemKindTask3     ItemKind = "Task3"
+	// ItemKindTask2 is a legacy task kind found in very old account histories.
+	ItemKindTask2     ItemKind = "Task2"
+	// ItemKindTask7 is written by Things 3.23+ for repeating tasks created in the app.
+	ItemKindTask7     ItemKind = "Task7"
 	ItemKindTaskPlain ItemKind = "Task"
 	// ItemKindArea identifies an Area
 	ItemKindArea      ItemKind = "Area2"
@@ -95,6 +99,17 @@ func IsSettingsKind(kind ItemKind) bool {
 		}
 	}
 	return true
+}
+
+// IsSettingsItem reports whether an item is Things settings metadata. Besides
+// versioned SettingsN kinds, very old account histories contain a record whose
+// UUID is the literal "Settings" and whose kind is a "-" placeholder (or the
+// unversioned "Settings"). Those records carry no task-graph data either.
+func IsSettingsItem(uuid string, kind ItemKind) bool {
+	if IsSettingsKind(kind) {
+		return true
+	}
+	return uuid == "Settings" && (kind == "-" || kind == "Settings")
 }
 
 // Timestamp allows unix epochs represented as float or ints to be unmarshalled

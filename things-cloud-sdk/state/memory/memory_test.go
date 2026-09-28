@@ -2,6 +2,7 @@ package memory
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	things "github.com/arthursoares/things-cloud-sdk"
@@ -499,7 +500,7 @@ func TestStateUpdateRejectsUnknownKind(t *testing.T) {
 	s := NewState()
 	err := s.Update(things.Item{
 		UUID:   "future-item",
-		Kind:   things.ItemKind("Task7"),
+		Kind:   things.ItemKind("Task99"),
 		Action: things.ItemActionCreated,
 		P:      []byte(`{}`),
 	})
@@ -523,5 +524,56 @@ func TestStateUpdateIgnoresVersionedSettings(t *testing.T) {
 	}
 	if len(s.Tasks) != 0 || len(s.Areas) != 0 || len(s.Tags) != 0 || len(s.CheckListItems) != 0 {
 		t.Fatalf("settings changed task graph: %#v", s)
+	}
+}
+
+func TestStateUpdateIgnoresLegacySettingsPlaceholder(t *testing.T) {
+	s := NewState()
+	for _, kind := range []things.ItemKind{"-", "Settings"} {
+		err := s.Update(things.Item{UUID: "Settings", Kind: kind, Action: things.ItemActionModified, P: []byte(`{}`)})
+		if err != nil {
+			t.Fatalf("legacy settings record (kind %q) blocked state update: %v", kind, err)
+		}
+	}
+	if err := s.Update(things.Item{UUID: "not-settings", Kind: "-", Action: things.ItemActionCreated, P: []byte(`{}`)}); err == nil {
+		t.Fatal("placeholder kind on a non-settings item should still be rejected")
+	}
+}
+
+func TestStateUpdateAcceptsMissingPayload(t *testing.T) {
+	s := NewState()
+	err := s.Update(things.Item{UUID: "CC-Things-Tag-Work", Kind: things.ItemKindTagPlain, Action: things.ItemActionModified})
+	if err != nil {
+		t.Fatalf("history entry without a payload blocked state update: %v", err)
+	}
+}
+
+func TestStateUpdateAcceptsTask2AndTask7(t *testing.T) {
+	s := NewState()
+	for _, kind := range []things.ItemKind{things.ItemKindTask2, things.ItemKindTask7} {
+		uuid := "task-" + string(kind)
+		err := s.Update(things.Item{UUID: uuid, Kind: kind, Action: things.ItemActionCreated, P: []byte(`{"tt":"` + string(kind) + `"}`)})
+		if err != nil {
+			t.Fatalf("kind %q blocked state update: %v", kind, err)
+		}
+	}
+	if len(s.Tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(s.Tasks))
+	}
+}
+
+func TestStateUpdateReportsAllProblemsInBatch(t *testing.T) {
+	s := NewState()
+	err := s.Update(
+		things.Item{UUID: "a", Kind: "Task98", Action: things.ItemActionCreated, P: []byte(`{}`)},
+		things.Item{UUID: "b", Kind: "Area97", Action: things.ItemActionCreated, P: []byte(`{}`)},
+	)
+	if err == nil {
+		t.Fatal("expected an error for unknown kinds")
+	}
+	for _, want := range []string{"2 unsupported history items", `"Task98"`, `"Area97"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention %s", err, want)
+		}
 	}
 }

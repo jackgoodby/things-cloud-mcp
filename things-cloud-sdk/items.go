@@ -18,6 +18,16 @@ type Item struct {
 	Action ItemAction      `json:"t"`
 }
 
+// PayloadOrEmpty returns the item's payload, or an empty JSON object when the
+// history entry carries no "p" field at all. Some legacy histories contain
+// such entries (for example old tag records); they carry no field changes.
+func (i Item) PayloadOrEmpty() json.RawMessage {
+	if len(i.P) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return i.P
+}
+
 type itemsResponse struct {
 	Items                  []map[string]Item `json:"items"`
 	LatestTotalContentSize int               `json:"latest-total-content-size"`

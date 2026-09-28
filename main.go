@@ -577,16 +577,65 @@ func newTaskCreatePayload(title string, opts map[string]string, ix int) TaskCrea
 	}
 }
 
-func newTemplatePayload(instance TaskCreatePayload, rr *json.RawMessage, nextOccurrence int64) TaskCreatePayload {
+// markInstanceGenerated records on a repeating template that the occurrence on
+// instanceDay already exists, the way the Things apps do after generating an
+// instance: instance creation resumes the day after it, one instance has been
+// created, and the template itself stays unscheduled (Someday, no start date)
+// with tir pointing at the next occurrence. Without this, a Things app that
+// sees icsd <= instanceDay and icc == 0 generates a duplicate instance.
+func markInstanceGenerated(template *TaskCreatePayload, instanceDay, nextOccurrence int64) {
+	resume := dayStartUTC(instanceDay) + 24*60*60
+	next := nextOccurrence
+	template.Icsd = &resume
+	template.Icc = 1
+	template.Tir = &next
+	template.Sr = nil
+	template.St = int(thingscloud.TaskScheduleSomeday)
+}
+
+// dayStartUTC truncates a Things day timestamp (midnight UTC of the local day)
+// to the start of that day.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// arrayFields are payload keys the Things apps decode as arrays. Writing null
+// for any of them makes the apps abort while applying a sync.
+var arrayFields = []string{"ar", "pr", "agr", "tg", "dl", "rt", "ts", "pn"}
+
+// rejectNullArrayFields refuses a commit that would write null to an array field.
+func rejectNullArrayFields(items []thingscloud.Item) error {
+	for _, item := range items {
+		if len(item.P) == 0 {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(item.P, &fields); err != nil {
+			return fmt.Errorf("item %s: %w", item.UUID, err)
+		}
+		for _, key := range arrayFields {
+			if v, ok := fields[key]; ok && string(v) == "null" {
+				return fmt.Errorf("item %s would write null to array field %q", item.UUID, key)
+			}
+		}
+	}
+	return nil
+}
+
+func dayStartUTC(ts int64) int64 {
+	d := time.Unix(ts, 0).UTC()
+	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC).Unix()
+}
+
+func newTemplatePayload(instance TaskCreatePayload, rr *json.RawMessage, instanceDay, nextOccurrence int64) TaskCreatePayload {
 	template := instance
-	today := todayMidnightUTC()
 	template.Rr = rr
-	template.Icsd = &today
 	template.Rt = []string{}
-	template.Sr = &nextOccurrence
-	template.Tir = &nextOccurrence
-	template.St = int(thingscloud.TaskScheduleAnytime)
 	template.Sb = 0
+	markInstanceGenerated(&template, instanceDay, nextOccurrence)
 	return template
 }
 
@@ -596,7 +645,7 @@ func splitRecurringPayload(payload TaskCreatePayload) (string, TaskCreatePayload
 	if payload.Rr == nil {
 		return "", TaskCreatePayload{}, TaskCreatePayload{}, fmt.Errorf("recurrence rule is required")
 	}
-	reference := time.Now().UTC()
+	reference := time.Unix(todayMidnightUTC(), 0).UTC()
 	if payload.Tir != nil {
 		reference = time.Unix(*payload.Tir, 0).UTC()
 	} else if payload.Sr != nil {
@@ -612,16 +661,17 @@ func splitRecurringPayload(payload TaskCreatePayload) (string, TaskCreatePayload
 	}
 
 	templateUUID := generateUUID()
-	template := newTemplatePayload(payload, payload.Rr, next.Unix())
+	template := newTemplatePayload(payload, payload.Rr, reference.Unix(), next.Unix())
 	instance := payload
 	instance.Rr = nil
 	instance.Icsd = nil
+	instance.Icc = 0
+	instance.Lt = true
 	instance.Rt = []string{templateUUID}
 	return templateUUID, template, instance, nil
 }
 
-func recurringTemplateForEdit(task *thingscloud.Task, req mcp.CallToolRequest, rr *json.RawMessage, nextOccurrence int64) TaskCreatePayload {
-	today := todayMidnightUTC()
+func recurringTemplateForEdit(task *thingscloud.Task, req mcp.CallToolRequest, rr *json.RawMessage, instanceDay, nextOccurrence int64) TaskCreatePayload {
 	title := task.Title
 	if v := req.GetString("title", ""); v != "" {
 		title = v
@@ -660,15 +710,20 @@ func recurringTemplateForEdit(task *thingscloud.Task, req mcp.CallToolRequest, r
 		}
 	}
 
-	return TaskCreatePayload{
-		Tp: int(task.Type), Sr: &nextOccurrence, Rt: []string{}, Ss: 0,
-		Tr: false, Dl: append([]string(nil), task.DelegateIDs...), Icp: false,
-		St: int(thingscloud.TaskScheduleAnytime), Ar: areas, Tt: title,
-		Do: task.DueOrder, Tir: &nextOccurrence, Tg: tags, Agr: headings,
-		Ix: task.Index, Cd: nowTs(), Lt: false, Icc: 0, Ti: 0, Dd: deadline,
-		Ato: task.AlarmTimeOffset, Nt: textNote(note), Icsd: &today, Pr: projects,
+	// Array fields must never be written as null: the Things apps abort
+	// while applying a sync that contains a null where they expect an array.
+	areas, projects, headings, tags = nonNil(areas), nonNil(projects), nonNil(headings), nonNil(tags)
+	template := TaskCreatePayload{
+		Tp: int(task.Type), Rt: []string{}, Ss: 0,
+		Tr: false, Dl: nonNil(append([]string(nil), task.DelegateIDs...)), Icp: false,
+		Ar: areas, Tt: title,
+		Do: task.DueOrder, Tg: tags, Agr: headings,
+		Ix: task.Index, Cd: nowTs(), Lt: false, Ti: 0, Dd: deadline,
+		Ato: task.AlarmTimeOffset, Nt: textNote(note), Pr: projects,
 		Sb: 0, Rr: rr, Xx: defaultExtension(),
 	}
+	markInstanceGenerated(&template, instanceDay, nextOccurrence)
+	return template
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1348,9 @@ func (t *ThingsMCP) writeAndSync(items ...thingscloud.Identifiable) error {
 	expected, err := identifiableItems(items)
 	if err != nil {
 		return fmt.Errorf("validate commit: %w", err)
+	}
+	if err := rejectNullArrayFields(expected); err != nil {
+		return fmt.Errorf("validate commit payload: %w", err)
 	}
 	if err := memory.NewState().Update(expected...); err != nil {
 		return fmt.Errorf("validate commit payload: %w", err)
@@ -3763,7 +3821,12 @@ func (t *ThingsMCP) handleEditTask(_ context.Context, req mcp.CallToolRequest) (
 		return errResult("uuid is required"), nil
 	}
 
-	if err := t.validateTaskUUID(taskUUID); err != nil {
+	// Trashed items are hidden from edits, except to restore them.
+	if req.GetString("status", "") == "restored" {
+		if task := t.findTask(taskUUID); task == nil {
+			return errResult(fmt.Sprintf("task not found: %s", taskUUID)), nil
+		}
+	} else if err := t.validateTaskUUID(taskUUID); err != nil {
 		return errResult(err.Error()), nil
 	}
 
@@ -3941,7 +4004,8 @@ func (t *ThingsMCP) handleEditTask(_ context.Context, req mcp.CallToolRequest) (
 			nextTir := nextDate.Unix()
 
 			newTemplateUUID := generateUUID()
-			template := recurringTemplateForEdit(editTarget, req, rr, nextTir)
+			instanceDay := time.Date(recRef.Year(), recRef.Month(), recRef.Day(), 0, 0, 0, 0, time.UTC).Unix()
+			template := recurringTemplateForEdit(editTarget, req, rr, instanceDay, nextTir)
 			envelopes = append(envelopes, writeEnvelope{id: newTemplateUUID, action: 0, kind: "Task6", payload: template})
 			u.fields["rt"] = []string{newTemplateUUID}
 			u.ClearRecurrence()
@@ -4436,6 +4500,13 @@ func defineTools(um *UserManager) []server.ServerTool {
 			),
 			Handler: wrap(func(t *ThingsMCP, ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 				return t.handleDebugRaw(ctx, req)
+			}),
+		},
+
+		{
+			Tool: debugHistoryTool(),
+			Handler: wrap(func(t *ThingsMCP, ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return t.handleDebugHistory(ctx, req)
 			}),
 		},
 

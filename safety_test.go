@@ -43,7 +43,7 @@ func TestJSONResultProvidesStructuredContent(t *testing.T) {
 
 func TestEveryToolDeclaresOutputSchema(t *testing.T) {
 	tools := defineTools(NewUserManager())
-	if got, want := len(tools), 23; got != want {
+	if got, want := len(tools), 24; got != want {
 		t.Fatalf("registered tool count = %d, want %d", got, want)
 	}
 	for _, serverTool := range tools {
@@ -160,6 +160,19 @@ func TestFullRebuildIgnoresSettings5Metadata(t *testing.T) {
 	tmcp := newTestThingsMCP(t, fc)
 	if task := tmcp.state.Tasks["task-1"]; task == nil || task.Title != "Visible after settings metadata" {
 		t.Fatalf("task graph was not rebuilt after Settings5: %#v", task)
+	}
+}
+
+func TestFullRebuildIgnoresLegacySettingsPlaceholder(t *testing.T) {
+	fc := newFakeCloud("test@example.com",
+		thingscloud.Item{UUID: "Settings", Kind: thingscloud.ItemKind("-"), Action: thingscloud.ItemActionModified, P: json.RawMessage(`{}`)},
+		makeTaskItem("task-1", withTitle("Visible after legacy settings record")),
+	)
+	defer fc.Close()
+
+	tmcp := newTestThingsMCP(t, fc)
+	if task := tmcp.state.Tasks["task-1"]; task == nil || task.Title != "Visible after legacy settings record" {
+		t.Fatalf("task graph was not rebuilt after legacy Settings record: %#v", task)
 	}
 }
 
@@ -347,8 +360,14 @@ func TestSplitRecurringPayloadCreatesTemplateAndInstance(t *testing.T) {
 	if templateUUID == "" || template.Rr == nil || template.Icsd == nil {
 		t.Fatalf("invalid template: uuid=%q rr=%v icsd=%v", templateUUID, template.Rr, template.Icsd)
 	}
-	if len(template.Rt) != 0 || template.St != 1 || template.Sb != 0 {
-		t.Fatalf("invalid template relationship/schedule: rt=%v st=%d sb=%d", template.Rt, template.St, template.Sb)
+	if len(template.Rt) != 0 || template.St != 2 || template.Sr != nil || template.Sb != 0 {
+		t.Fatalf("invalid template relationship/schedule: rt=%v st=%d sr=%v sb=%d", template.Rt, template.St, template.Sr, template.Sb)
+	}
+	// The Things apps generate an instance for every occurrence on or after
+	// icsd while icc says none exist yet. Because the visible instance is
+	// written here, the template must record it or the apps duplicate it.
+	if template.Icc != 1 || instance.Tir == nil || *template.Icsd != *instance.Tir+24*60*60 {
+		t.Fatalf("template does not record the generated instance: icc=%d icsd=%v instance tir=%v", template.Icc, *template.Icsd, instance.Tir)
 	}
 	if instance.Rr != nil || instance.Icsd != nil || len(instance.Rt) != 1 || instance.Rt[0] != templateUUID {
 		t.Fatalf("invalid instance: rr=%v icsd=%v rt=%v", instance.Rr, instance.Icsd, instance.Rt)
@@ -578,4 +597,51 @@ func containsRune(s string, want rune) bool {
 		}
 	}
 	return false
+}
+
+func TestWriteRejectsNullArrayFields(t *testing.T) {
+	items := []thingscloud.Item{{UUID: "task-1", Kind: thingscloud.ItemKind("Task6"), Action: thingscloud.ItemActionCreated, P: json.RawMessage(`{"tt":"x","tg":null}`)}}
+	if err := rejectNullArrayFields(items); err == nil {
+		t.Fatal("expected a null array field to be rejected")
+	}
+	items[0].P = json.RawMessage(`{"tt":"x","tg":[],"rr":null}`)
+	if err := rejectNullArrayFields(items); err != nil {
+		t.Fatalf("valid payload rejected: %v", err)
+	}
+}
+
+func TestRecurringTemplateForEditNeverWritesNullArrays(t *testing.T) {
+	task := &thingscloud.Task{UUID: "task-1", Title: "plain"}
+	next := time.Now().Add(24 * time.Hour).Unix()
+	template := recurringTemplateForEdit(task, makeReq(map[string]any{}), nil, todayMidnightUTC(), next)
+	b, err := json.Marshal(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rejectNullArrayFields([]thingscloud.Item{{UUID: "t", P: b}}); err != nil {
+		t.Fatalf("template for edit writes null arrays: %v", err)
+	}
+}
+
+func TestEditCanRestoreTrashedTask(t *testing.T) {
+	fc := newFakeCloud("test@example.com", makeTaskItem("trashed-1", withTitle("in trash"), withTrashed()))
+	defer fc.Close()
+	tmcp := newTestThingsMCP(t, fc)
+
+	result, err := tmcp.handleEditTask(context.Background(), makeReq(map[string]any{"uuid": "trashed-1", "title": "renamed"}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("editing a trashed task without restoring it should be refused")
+	}
+
+	result, err = tmcp.handleEditTask(context.Background(), makeReq(map[string]any{"uuid": "trashed-1", "status": "restored"}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	assertNotError(t, result)
+	if task := tmcp.state.Tasks["trashed-1"]; task == nil || task.InTrash {
+		t.Fatalf("task was not restored: %#v", task)
+	}
 }

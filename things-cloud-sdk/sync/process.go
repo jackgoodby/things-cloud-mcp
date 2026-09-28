@@ -60,12 +60,13 @@ func (s *Syncer) processItems(items []things.Item, baseIndex int) ([]Change, err
 
 // processItem routes an item to the correct handler based on its Kind.
 func (s *Syncer) processItem(item things.Item, serverIndex int, ts time.Time) ([]Change, error) {
-	if things.IsSettingsKind(item.Kind) {
+	if things.IsSettingsItem(item.UUID, item.Kind) {
 		// Versioned settings are account metadata, not task-graph entities.
 		return nil, nil
 	}
+	item.P = item.PayloadOrEmpty()
 	switch item.Kind {
-	case things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain:
+	case things.ItemKindTask, things.ItemKindTask7, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain:
 		return s.processTaskItem(item, serverIndex, ts)
 	case things.ItemKindArea, things.ItemKindArea3, things.ItemKindAreaPlain:
 		return s.processAreaItem(item, serverIndex, ts)

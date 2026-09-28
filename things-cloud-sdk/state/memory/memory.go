@@ -2,9 +2,11 @@ package memory
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	// "fmt"
 	"sort"
+	"strings"
 
 	things "github.com/arthursoares/things-cloud-sdk"
 )
@@ -35,7 +37,7 @@ func NewState() *State {
 // records, so replay must normalize both object keys and relationship fields.
 func isLegacyItemKind(kind things.ItemKind) bool {
 	switch kind {
-	case things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain,
+	case things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain,
 		things.ItemKindChecklistItem, things.ItemKindChecklistItem2,
 		things.ItemKindArea, things.ItemKindAreaPlain,
 		things.ItemKindTag, things.ItemKindTagPlain,
@@ -290,21 +292,44 @@ func (s *State) updateTag(item things.TagActionItem) *things.Tag {
 	return t
 }
 
+// summarizeProblems turns the validation problems of a batch into one error,
+// listing up to maxListedProblems of them.
+func summarizeProblems(problems []string) error {
+	const maxListedProblems = 20
+	listed := problems
+	if len(listed) > maxListedProblems {
+		listed = listed[:maxListedProblems]
+	}
+	msg := strings.Join(listed, "; ")
+	if len(problems) > len(listed) {
+		msg += fmt.Sprintf("; and %d more", len(problems)-len(listed))
+	}
+	if len(problems) > 1 {
+		msg = fmt.Sprintf("%d unsupported history items: %s", len(problems), msg)
+	}
+	return errors.New(msg)
+}
+
 // Update applies all items to update the aggregated state
 func (s *State) Update(items ...things.Item) error {
 	// Validate the whole batch first. Advancing a sync cursor after silently
 	// skipping a future or malformed event would make the local state permanently
 	// incomplete, so updates are all-or-nothing with respect to decoding.
+	// Every problem in the batch is collected before failing, so a history with
+	// several unsupported records can be diagnosed in one pass.
+	var problems []string
 	for _, rawItem := range items {
-		if things.IsSettingsKind(rawItem.Kind) {
+		if things.IsSettingsItem(rawItem.UUID, rawItem.Kind) {
 			continue
 		}
+		rawItem.P = rawItem.PayloadOrEmpty()
 		if rawItem.Action != things.ItemActionCreated && rawItem.Action != things.ItemActionModified && rawItem.Action != things.ItemActionDeleted {
-			return fmt.Errorf("item %s (%s) has unsupported action %d", rawItem.UUID, rawItem.Kind, rawItem.Action)
+			problems = append(problems, fmt.Sprintf("item %s (%s) has unsupported action %d", rawItem.UUID, rawItem.Kind, rawItem.Action))
+			continue
 		}
 		var target any
 		switch rawItem.Kind {
-		case things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain:
+		case things.ItemKindTask, things.ItemKindTask7, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain:
 			target = &things.TaskActionItemPayload{}
 		case things.ItemKindChecklistItem, things.ItemKindChecklistItem2, things.ItemKindChecklistItem3:
 			target = &things.CheckListActionItemPayload{}
@@ -315,23 +340,28 @@ func (s *State) Update(items ...things.Item) error {
 		case things.ItemKindTombstone, things.ItemKindTombstonePlain:
 			target = &things.TombstoneActionItemPayload{}
 		default:
-			return fmt.Errorf("item %s has unsupported kind %q", rawItem.UUID, rawItem.Kind)
+			problems = append(problems, fmt.Sprintf("item %s has unsupported kind %q", rawItem.UUID, rawItem.Kind))
+			continue
 		}
 		if err := json.Unmarshal(rawItem.P, target); err != nil {
-			return fmt.Errorf("decode item %s (%s): %w", rawItem.UUID, rawItem.Kind, err)
+			problems = append(problems, fmt.Sprintf("decode item %s (%s): %v", rawItem.UUID, rawItem.Kind, err))
 		}
+	}
+	if len(problems) > 0 {
+		return summarizeProblems(problems)
 	}
 
 	for _, rawItem := range items {
-		if things.IsSettingsKind(rawItem.Kind) {
+		if things.IsSettingsItem(rawItem.UUID, rawItem.Kind) {
 			continue
 		}
+		rawItem.P = rawItem.PayloadOrEmpty()
 		legacy := isLegacyItemKind(rawItem.Kind)
 		if legacy && things.ValidateUUID(rawItem.UUID) != nil {
 			rawItem.UUID = things.EncodeLegacyIdentifier(rawItem.UUID)
 		}
 		switch rawItem.Kind {
-		case things.ItemKindTask, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTaskPlain:
+		case things.ItemKindTask, things.ItemKindTask7, things.ItemKindTask4, things.ItemKindTask3, things.ItemKindTask2, things.ItemKindTaskPlain:
 			item := things.TaskActionItem{Item: rawItem}
 			_ = json.Unmarshal(rawItem.P, &item.P)
 			if legacy {
